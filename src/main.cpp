@@ -7,6 +7,7 @@
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 #include "wifi_credentials.h"
+#include <ArduinoJson.h>
 
 // Waveshare ESP32-C6-GEEK: ST7789 240x135, SPI
 class LGFX : public lgfx::LGFX_Device {
@@ -68,9 +69,180 @@ static bool        wifiConnected = false;
 
 static const char AP_SSID[] = "ESP32-C6-GEEK";
 
+// ---------------------------------------------------------------------------
+// LCD — color constants (RGB565) and state
+// ---------------------------------------------------------------------------
+//
+// Layout (240×135, landscape):
+//   y=  0–11  WiFi + IP row
+//   y= 12     separator
+//   y= 13–30  stop name (text size 2)
+//   y= 31     separator
+//   y= 32–41  column headers
+//   y= 42     separator
+//   y= 43–133 up to 6 departure rows × 15 px
+//
+#define LCD_BG_DARK    0x0000   // black          — main background
+#define LCD_BG_HEADER  0x0841   // very dark navy — WiFi row
+#define LCD_BG_ROW0    0x0841   // very dark navy — even dep rows
+#define LCD_BG_ROW1    0x1082   // dark steel     — odd dep rows
+#define LCD_BG_CANCEL  0x4000   // dark red       — cancelled rows
+#define LCD_SEP        0x2945   // mid gray       — separator lines
+#define LCD_WIFI       0x07FF   // cyan
+#define LCD_STOP       0xFFE0   // yellow
+#define LCD_HDR_TXT    0x8C51   // medium gray
+#define LCD_LINE_TXT   0xFFFF   // white
+#define LCD_MODE_TXT   0x07FF   // cyan
+#define LCD_DIR_TXT    0xC618   // light gray
+#define LCD_OK         0x07E0   // green
+#define LCD_LATE       0xFD20   // orange
+#define LCD_CANCEL_TXT 0xF800   // red
+
+struct LcdDep {
+    String line;       // route designation, e.g. "43"
+    String mode;       // 3-char mode abbr, e.g. "BUS"
+    String direction;  // e.g. "Balsta"
+    String scheduled;  // "HH:MM"
+    int    delay;      // seconds
+    bool   canceled;
+};
+static LcdDep  lcdDeps[6];
+static int     lcdDepCount  = 0;
+static String  lcdWifiSsid  = "";
+static String  lcdWifiIp    = "";
+static String  lcdStopName  = "";
+
+// Convert UTF-8 to ASCII for the 6×8 LCD font (handles Swedish å/ä/ö etc.)
+static String toLcdStr(const String& s) {
+    String out;
+    out.reserve(s.length());
+    for (size_t i = 0; i < s.length(); ) {
+        uint8_t c = (uint8_t)s[i];
+        if (c < 0x80) { out += (char)c; i++; }
+        else if (c == 0xC3 && i + 1 < s.length()) {
+            uint8_t n = (uint8_t)s[i + 1];
+            if      (n == 0xA5 || n == 0x85) out += 'a'; // å Å
+            else if (n == 0xA4 || n == 0x84) out += 'a'; // ä Ä
+            else if (n == 0xB6 || n == 0x96) out += 'o'; // ö Ö
+            else if (n == 0xA9)              out += 'e'; // é
+            else                             out += '?';
+            i += 2;
+        } else {
+            i++;
+            while (i < s.length() && ((uint8_t)s[i] & 0xC0) == 0x80) i++;
+        }
+    }
+    return out;
+}
+
+static String modeAbbr(const String& m) {
+    if (m == "BUS")   return "BUS";
+    if (m == "TRAIN") return "TRN";
+    if (m == "METRO") return "MTR";
+    if (m == "TRAM")  return "TRM";
+    if (m == "TAXI")  return "TAX";
+    return m.substring(0, 3);
+}
+
+void renderLcd() {
+    lcd.fillScreen(LCD_BG_DARK);
+
+    // WiFi / IP row
+    lcd.fillRect(0, 0, 240, 12, LCD_BG_HEADER);
+    lcd.setTextSize(1);
+    lcd.setTextColor(LCD_WIFI, LCD_BG_HEADER);
+    lcd.setCursor(2, 2);
+    if (lcdWifiSsid.isEmpty()) {
+        lcd.print("WiFi: connecting...");
+    } else {
+        lcd.print(toLcdStr("WiFi: " + lcdWifiSsid + "  " + lcdWifiIp).substring(0, 39));
+    }
+
+    lcd.drawFastHLine(0, 12, 240, LCD_SEP);
+
+    if (lcdStopName.isEmpty()) {
+        // No stop selected yet — guide the user
+        lcd.setTextSize(1);
+        lcd.setTextColor(LCD_DIR_TXT, LCD_BG_DARK);
+        lcd.setCursor(2, 22);
+        lcd.print("Open browser:");
+        lcd.setCursor(2, 34);
+        lcd.print(lcdWifiIp.c_str());
+        return;
+    }
+
+    // Stop name (size 2, up to 19 chars)
+    lcd.setTextSize(2);
+    lcd.setTextColor(LCD_STOP, LCD_BG_DARK);
+    lcd.setCursor(2, 14);
+    lcd.print(toLcdStr(lcdStopName).substring(0, 19));
+
+    lcd.drawFastHLine(0, 31, 240, LCD_SEP);
+
+    // Column headers
+    //   x=2  : Line (designation + mode)
+    //   x=56 : Direction
+    //   x=152: Sched
+    //   x=192: Dly
+    lcd.setTextSize(1);
+    lcd.setTextColor(LCD_HDR_TXT, LCD_BG_DARK);
+    lcd.setCursor(2,   33); lcd.print("Line");
+    lcd.setCursor(56,  33); lcd.print("Direction");
+    lcd.setCursor(152, 33); lcd.print("Sched");
+    lcd.setCursor(192, 33); lcd.print("Dly");
+
+    lcd.drawFastHLine(0, 42, 240, LCD_SEP);
+
+    // Departure rows
+    for (int i = 0; i < lcdDepCount && i < 6; i++) {
+        int      y  = 43 + i * 15;
+        uint16_t bg = lcdDeps[i].canceled ? LCD_BG_CANCEL
+                    : (i % 2 == 0)        ? LCD_BG_ROW0
+                                          : LCD_BG_ROW1;
+        lcd.fillRect(0, y, 240, 15, bg);
+
+        int ty = y + 3; // centre 8px text in 15px row
+
+        // Designation (4 chars) at x=2, mode abbr (3 chars) at x=32
+        lcd.setTextColor(LCD_LINE_TXT, bg);
+        lcd.setCursor(2, ty);
+        lcd.print(lcdDeps[i].line.substring(0, 4));
+
+        lcd.setTextColor(LCD_MODE_TXT, bg);
+        lcd.setCursor(32, ty);
+        lcd.print(lcdDeps[i].mode);
+
+        // Direction (15 chars) at x=56
+        lcd.setTextColor(LCD_DIR_TXT, bg);
+        lcd.setCursor(56, ty);
+        lcd.print(toLcdStr(lcdDeps[i].direction).substring(0, 15));
+
+        // Scheduled time at x=152
+        uint16_t tCol = lcdDeps[i].canceled ? LCD_CANCEL_TXT
+                      : lcdDeps[i].delay > 60 ? LCD_LATE : LCD_OK;
+        lcd.setTextColor(tCol, bg);
+        lcd.setCursor(152, ty);
+        lcd.print(lcdDeps[i].scheduled);
+
+        // Delay / status at x=192
+        if (lcdDeps[i].canceled) {
+            lcd.setTextColor(LCD_CANCEL_TXT, bg);
+            lcd.setCursor(192, ty);
+            lcd.print("CNCL");
+        } else if (lcdDeps[i].delay > 60) {
+            lcd.setTextColor(LCD_LATE, bg);
+            lcd.setCursor(192, ty);
+            char buf[6];
+            snprintf(buf, sizeof(buf), "+%dm", (lcdDeps[i].delay + 30) / 60);
+            lcd.print(buf);
+        }
+    }
+}
+
 // Forward declarations
 void startWebServer();
 void handleSettings();
+void renderLcd();
 
 // URL-encode a string for use in a URL path segment
 static String urlEncode(const String& s) {
@@ -217,6 +389,7 @@ const updated  = document.getElementById('updated');
 
 let stopMeta   = {};   // id -> { name, lat, lon }
 let currentId  = null;
+let currentName= '';
 let refreshTmr = null;
 
 // Clock
@@ -263,6 +436,7 @@ async function search(){
 function onStopSelect(id){
   clearInterval(refreshTmr);
   currentId=id;
+  currentName=id&&stopMeta[id]?stopMeta[id].name:'';
   if(!id){stopinfo.innerHTML='';return;}
   const m=stopMeta[id];
   if(m&&m.lat!=null){
@@ -286,7 +460,7 @@ function fmtDelay(s){
 async function loadDeps(id){
   if(!id)return;
   try{
-    const r=await fetch('/api/departures?stopId='+id);
+    const r=await fetch('/api/departures?stopId='+id+'&stopName='+encodeURIComponent(currentName));
     const d=await r.json();
     if(d.api_key_invalid){deps.innerHTML='<p>API key invalid. <a href="/settings">Update in Settings</a>.</p>';clearInterval(refreshTmr);return;}
     if(d.error){deps.innerHTML='<p>Error: '+d.error+'</p>';return;}
@@ -474,13 +648,67 @@ void handleApiStops() {
 }
 
 void handleApiDepartures() {
-    String stopId = server.arg("stopId");
+    String stopId   = server.arg("stopId");
+    String stopName = server.arg("stopName");
     if (stopId.isEmpty()) {
         server.send(400, "application/json", "{\"error\":\"stopId parameter required\"}");
         return;
     }
-    proxyGet(String("https://realtime-api.trafiklab.se/v1/departures/")
-             + stopId + "?key=" + getApiKey());
+
+    String url = String("https://realtime-api.trafiklab.se/v1/departures/")
+                 + stopId + "?key=" + getApiKey();
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.begin(client, url);
+    http.setTimeout(10000);
+    int code = http.GET();
+
+    if (code == HTTP_CODE_OK) {
+        String body = http.getString();
+        http.end();
+
+        // Parse subset of response to update the LCD
+        if (!stopName.isEmpty()) lcdStopName = stopName;
+
+        JsonDocument filter;
+        filter["departures"][0]["route"]["designation"]    = true;
+        filter["departures"][0]["route"]["transport_mode"] = true;
+        filter["departures"][0]["route"]["direction"]      = true;
+        filter["departures"][0]["scheduled"]               = true;
+        filter["departures"][0]["delay"]                   = true;
+        filter["departures"][0]["canceled"]                = true;
+
+        JsonDocument doc;
+        if (!deserializeJson(doc, body, DeserializationOption::Filter(filter))) {
+            JsonArray arr = doc["departures"].as<JsonArray>();
+            lcdDepCount = 0;
+            for (JsonObject dep : arr) {
+                if (lcdDepCount >= 6) break;
+                LcdDep& d   = lcdDeps[lcdDepCount++];
+                d.line      = String(dep["route"]["designation"] | "?");
+                d.mode      = modeAbbr(String(dep["route"]["transport_mode"] | ""));
+                d.direction = String(dep["route"]["direction"]   | "?");
+                const char* s = dep["scheduled"] | "";
+                d.scheduled = strlen(s) >= 16 ? String(s).substring(11, 16) : "--:--";
+                d.delay     = dep["delay"]    | 0;
+                d.canceled  = dep["canceled"] | false;
+            }
+            renderLcd();
+        }
+
+        server.send(200, "application/json", body);
+    } else if (code == 401 || code == 403) {
+        http.end();
+        server.send(200, "application/json",
+            "{\"error\":\"API key invalid or missing (HTTP " + String(code) + ")\","
+            "\"api_key_invalid\":true}");
+    } else {
+        http.end();
+        server.send(502, "application/json",
+            "{\"error\":\"API returned " + String(code) + "\"}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -510,13 +738,10 @@ bool connectWifi() {
 
     if (WiFi.status() == WL_CONNECTED) {
         wifiConnected = true;
-        lcd.setCursor(10, 55);
-        lcd.setTextColor(TFT_GREEN, TFT_BLACK);
-        lcd.printf("WiFi: %-20s", ssid.c_str());
-        lcd.setCursor(10, 68);
-        lcd.print("IP: ");
-        lcd.print(WiFi.localIP().toString().c_str());
-        Serial.println("Connected! IP: " + WiFi.localIP().toString());
+        lcdWifiSsid = ssid;
+        lcdWifiIp   = WiFi.localIP().toString();
+        Serial.println("Connected! IP: " + lcdWifiIp);
+        renderLcd();
         startWebServer();
         return true;
     }
